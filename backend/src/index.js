@@ -27,15 +27,27 @@ const PORT = process.env.PORT || 4000;
 // ── Allowed CORS origins ──────────────────────────────────────────────────────
 const allowedOrigins = (process.env.CORS_ORIGINS || "http://localhost:3000")
   .split(",")
-  .map(s => s.trim());
+  .map(s => s.trim().replace(/\/$/, "")); // strip trailing slashes
 
-// ── Global middleware ─────────────────────────────────────────────────────────
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow requests with no origin (curl, mobile apps) or listed origins
-    if (!origin || allowedOrigins.includes(origin)) cb(null, true);
-    else cb(new Error(`CORS: origin ${origin} not allowed`));
+    // Allow requests with no origin (mobile apps, curl, Postman)
+    if (!origin) return cb(null, true);
+    // Strip trailing slash from incoming origin before comparing
+    const normalised = origin.replace(/\/$/, "");
+    // Allow exact matches
+    if (allowedOrigins.includes(normalised)) return cb(null, true);
+    // Allow all Vercel preview deployments for the same project
+    // e.g. doctor-booked-git-main-xyz.vercel.app
+    const isVercelPreview = allowedOrigins.some(o => {
+      const base = o.replace(/^https?:\/\//, "").split(".")[0];
+      return normalised.includes(base);
+    });
+    if (isVercelPreview) return cb(null, true);
+    // In development allow everything
+    if (process.env.NODE_ENV !== "production") return cb(null, true);
+    cb(new Error(`CORS: origin ${origin} not allowed`));
   },
   credentials: true,
 }));
