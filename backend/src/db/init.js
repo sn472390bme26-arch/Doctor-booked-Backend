@@ -9,8 +9,11 @@ const dir = path.dirname(DB_PATH);
 if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
 const db = new Database(DB_PATH);
-db.pragma("journal_mode = WAL");
+db.pragma("journal_mode = WAL");   // allows concurrent reads during writes
+db.pragma("busy_timeout = 5000");  // retry locked DB for up to 5s instead of failing instantly
+db.pragma("synchronous = NORMAL"); // safe with WAL, faster than FULL
 db.pragma("foreign_keys = ON");
+db.pragma("cache_size = -32000");  // 32MB page cache
 
 db.exec(`
   -- ─────────────────────────────────────────────

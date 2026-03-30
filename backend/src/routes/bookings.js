@@ -97,38 +97,68 @@ router.post(
 
     const patient = db.prepare("SELECT * FROM users WHERE id=?").get(req.user.id);
 
-    db.prepare(`
-      INSERT INTO bookings
-        (id, patient_id, patient_name, doctor_id, doctor_name, hospital_name,
-         date, session, token_number, session_id, payment_done, status, phone, complaint)
-      VALUES (?,?,?,?,?,?,?,?,?,?,1,'confirmed',?,?)
-    `).run(
-      id, req.user.id, patient.name,
-      doctorId, doctor.name,
-      hospital ? hospital.name : "Unknown",
-      date, session, tokenNumber, sessionId, phone, complaint
-    );
+    // Wrap entire booking creation in a transaction so it never partially commits
+    const createBookingTx = db.transaction(() => {
+      // Re-check capacity inside transaction (prevents race conditions)
+      const freshCount = db.prepare(
+        "SELECT COUNT(*) as c FROM bookings WHERE session_id=? AND payment_done=1 AND status!='cancelled'"
+      ).get(sessionId).c;
+      if (freshCount >= doctor.tokens_per_session)
+        throw Object.assign(new Error("This session is fully booked"), { status: 409 });
 
-    // Initialise or update token state
-    const existing = db.prepare("SELECT * FROM token_states WHERE session_id=?").get(sessionId);
-    if (existing) {
-      const statuses = JSON.parse(existing.token_statuses);
-      statuses[tokenNumber] = "red";
-      db.prepare("UPDATE token_states SET token_statuses=?, updated_at=datetime('now') WHERE session_id=?")
-        .run(JSON.stringify(statuses), sessionId);
-    } else {
-      const statuses = { [tokenNumber]: "red" };
+      const freshDup = db.prepare(
+        "SELECT id FROM bookings WHERE session_id=? AND patient_id=? AND status!='cancelled'"
+      ).get(sessionId, req.user.id);
+      if (freshDup)
+        throw Object.assign(new Error("You already have a booking in this session"), { status: 409 });
+
+      const freshToken = freshCount + 1;
+
       db.prepare(`
-        INSERT INTO token_states (session_id, doctor_id, date, session, token_statuses)
-        VALUES (?,?,?,?,?)
-      `).run(sessionId, doctorId, date, session, JSON.stringify(statuses));
+        INSERT INTO bookings
+          (id, patient_id, patient_name, doctor_id, doctor_name, hospital_name,
+           date, session, token_number, session_id, payment_done, status, phone, complaint)
+        VALUES (?,?,?,?,?,?,?,?,?,?,1,'confirmed',?,?)
+      `).run(
+        id, req.user.id, patient.name,
+        doctorId, doctor.name,
+        hospital ? hospital.name : "Unknown",
+        date, session, freshToken, sessionId, phone, complaint
+      );
+
+      // Initialise or update token state
+      const existing = db.prepare("SELECT * FROM token_states WHERE session_id=?").get(sessionId);
+      if (existing) {
+        const statuses = JSON.parse(existing.token_statuses || "{}");
+        statuses[freshToken] = "red";
+        db.prepare("UPDATE token_states SET token_statuses=?, updated_at=datetime('now') WHERE session_id=?")
+          .run(JSON.stringify(statuses), sessionId);
+      } else {
+        const statuses = { [freshToken]: "red" };
+        db.prepare(`
+          INSERT INTO token_states (session_id, doctor_id, date, session, token_statuses)
+          VALUES (?,?,?,?,?)
+        `).run(sessionId, doctorId, date, session, JSON.stringify(statuses));
+      }
+
+      return freshToken;
+    });
+
+    let finalToken;
+    try {
+      finalToken = createBookingTx();
+    } catch (txErr) {
+      console.error("[bookings POST] transaction error:", txErr.message);
+      return res.status(txErr.status || 500).json({ error: txErr.message });
     }
 
+    // Re-fetch the booking with correct token number
     const booking = row2booking(db.prepare("SELECT * FROM bookings WHERE id=?").get(id));
 
     // Broadcast token state update via WebSocket
-    broadcast(sessionId, { type: "token_booked", tokenNumber, sessionId });
+    broadcast(sessionId, { type: "token_booked", tokenNumber: finalToken, sessionId });
 
+    console.log(`[bookings POST] created booking ${id} token ${finalToken} session ${sessionId}`);
     res.status(201).json(booking);
   }
 );

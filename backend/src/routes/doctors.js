@@ -161,17 +161,25 @@ router.patch("/:id", requireDoctorOrAdmin, (req, res) => {
 
 // DELETE doctor (admin only)
 router.delete("/:id", requireAdmin, (req, res) => {
-  const row = db.prepare("SELECT * FROM doctors WHERE id=?").get(req.params.id);
-  if (!row) return res.status(404).json({ error: "Doctor not found" });
+  try {
+    const row = db.prepare("SELECT * FROM doctors WHERE id=?").get(req.params.id);
+    if (!row) return res.status(404).json({ error: "Doctor not found" });
 
-  // Cancel open bookings for this doctor
-  db.prepare(
-    "UPDATE bookings SET status='cancelled' WHERE doctor_id=? AND status='confirmed'"
-  ).run(req.params.id);
+    // Wrap in transaction so delete is atomic
+    db.transaction(() => {
+      db.prepare(
+        "UPDATE bookings SET status='cancelled' WHERE doctor_id=? AND status='confirmed'"
+      ).run(req.params.id);
+      db.prepare("DELETE FROM token_states WHERE doctor_id=?").run(req.params.id);
+      db.prepare("DELETE FROM doctors WHERE id=?").run(req.params.id);
+    })();
 
-  db.prepare("DELETE FROM token_states WHERE doctor_id=?").run(req.params.id);
-  db.prepare("DELETE FROM doctors WHERE id=?").run(req.params.id);
-  res.json({ success: true });
+    console.log(`[doctors DELETE] deleted doctor ${req.params.id}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[doctors DELETE] ERROR:", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = router;

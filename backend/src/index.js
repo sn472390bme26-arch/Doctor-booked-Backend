@@ -11,6 +11,15 @@ const path    = require("path");
 require("./db/init");
 const { setupWebSocket } = require("./services/ws");
 
+// ── Global crash guards — log everything, never die silently ─────────────────
+process.on("uncaughtException", (err) => {
+  console.error("[UNCAUGHT EXCEPTION]", err.message);
+  console.error(err.stack);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[UNHANDLED REJECTION]", reason);
+});
+
 const authRoutes     = require("./routes/auth");
 const hospitalRoutes = require("./routes/hospitals");
 const doctorRoutes   = require("./routes/doctors");
