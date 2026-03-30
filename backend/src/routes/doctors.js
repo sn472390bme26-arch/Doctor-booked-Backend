@@ -24,6 +24,7 @@ function row2doctor(r) {
     name: r.name,
     specialty: r.specialty,
     phone: r.phone || "",
+    contactPhone: r.phone || "",   // alias so frontend contactPhone field always has the value
     bio: r.bio || "",
     photo: r.photo || null,
     price: r.price,
@@ -135,9 +136,9 @@ router.patch("/:id", requireDoctorOrAdmin, (req, res) => {
       phone              = COALESCE(?, phone)
     WHERE id=?
   `).run(
-    name ?? null,
-    specialty ?? null,
-    hospitalId ?? null,
+    name || null,
+    specialty || null,
+    hospitalId || null,
     isAvailable !== undefined ? (isAvailable ? 1 : 0) : null,
     bio ?? null,
     photo ?? null,
@@ -150,7 +151,8 @@ router.patch("/:id", requireDoctorOrAdmin, (req, res) => {
     price ?? null,
     consultationFee ?? price ?? null,
     // contactPhone maps to phone column — accept either field name
-    contactPhone ?? phone ?? null,
+    // Treat empty string as null so we never overwrite an existing phone with ""
+    (contactPhone || phone || null) || null,
     req.params.id
   );
 
