@@ -1,7 +1,6 @@
 "use strict";
 const express = require("express");
 const { body, validationResult } = require("express-validator");
-const { v4: uuid } = require("../utils/id");
 const db = require("../db/init");
 const { requireAuth, requireAdmin } = require("../middleware/auth");
 const multer = require("multer");
@@ -29,9 +28,22 @@ const upload = multer({
   },
 });
 
-function row2hospital(r) {
+// Build a fully-qualified photo URL so Vercel frontend can load it from Railway
+function buildPhotoUrl(req, relativePath) {
+  if (!relativePath) return null;
+  // If already a full URL, return as-is
+  if (relativePath.startsWith("http")) return relativePath;
+  // Build full URL from request origin
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const host  = req.headers["x-forwarded-host"] || req.headers.host || "";
+  return `${proto}://${host}${relativePath}`;
+}
+
+function row2hospital(r, req) {
   if (!r) return null;
-  const doctorCount = db.prepare("SELECT COUNT(*) as c FROM doctors WHERE hospital_id=?").get(r.id).c;
+  const doctorCount = db.prepare(
+    "SELECT COUNT(*) as c FROM doctors WHERE hospital_id=?"
+  ).get(r.id).c;
   return {
     id: r.id,
     name: r.name,
@@ -40,7 +52,7 @@ function row2hospital(r) {
     phone: r.phone || "",
     rating: r.rating,
     gradient: r.gradient,
-    photoUrl: r.photo_url || null,
+    photoUrl: r.photo_url ? buildPhotoUrl(req, r.photo_url) : null,
     doctorCount,
   };
 }
@@ -48,14 +60,14 @@ function row2hospital(r) {
 // GET all hospitals (public)
 router.get("/", (req, res) => {
   const rows = db.prepare("SELECT * FROM hospitals ORDER BY name ASC").all();
-  res.json(rows.map(row2hospital));
+  res.json(rows.map(r => row2hospital(r, req)));
 });
 
 // GET single hospital
 router.get("/:id", (req, res) => {
   const row = db.prepare("SELECT * FROM hospitals WHERE id=?").get(req.params.id);
   if (!row) return res.status(404).json({ error: "Hospital not found" });
-  res.json(row2hospital(row));
+  res.json(row2hospital(row, req));
 });
 
 // POST create hospital (admin only)
@@ -71,32 +83,33 @@ router.post(
     if (!errors.isEmpty())
       return res.status(400).json({ error: errors.array()[0].msg });
 
-    const { name, area, address = "", phone = "", gradient = "from-slate-400 to-slate-600" } = req.body;
+    const {
+      name, area, address = "", phone = "",
+      gradient = "from-slate-400 to-slate-600",
+    } = req.body;
     const id = `h_${Date.now()}`;
     db.prepare(
       "INSERT INTO hospitals (id, name, area, address, phone, gradient) VALUES (?,?,?,?,?,?)"
     ).run(id, name, area, address, phone, gradient);
 
-    res.status(201).json(row2hospital(db.prepare("SELECT * FROM hospitals WHERE id=?").get(id)));
+    const row = db.prepare("SELECT * FROM hospitals WHERE id=?").get(id);
+    res.status(201).json(row2hospital(row, req));
   }
 );
 
 // PATCH update hospital (admin only)
-router.patch(
-  "/:id",
-  requireAdmin,
-  (req, res) => {
-    const row = db.prepare("SELECT * FROM hospitals WHERE id=?").get(req.params.id);
-    if (!row) return res.status(404).json({ error: "Hospital not found" });
+router.patch("/:id", requireAdmin, (req, res) => {
+  const row = db.prepare("SELECT * FROM hospitals WHERE id=?").get(req.params.id);
+  if (!row) return res.status(404).json({ error: "Hospital not found" });
 
-    const { name, area, address, phone } = req.body;
-    db.prepare(
-      "UPDATE hospitals SET name=COALESCE(?,name), area=COALESCE(?,area), address=COALESCE(?,address), phone=COALESCE(?,phone) WHERE id=?"
-    ).run(name || null, area || null, address ?? null, phone ?? null, req.params.id);
+  const { name, area, address, phone } = req.body;
+  db.prepare(
+    "UPDATE hospitals SET name=COALESCE(?,name), area=COALESCE(?,area), address=COALESCE(?,address), phone=COALESCE(?,phone) WHERE id=?"
+  ).run(name || null, area || null, address ?? null, phone ?? null, req.params.id);
 
-    res.json(row2hospital(db.prepare("SELECT * FROM hospitals WHERE id=?").get(req.params.id)));
-  }
-);
+  const updated = db.prepare("SELECT * FROM hospitals WHERE id=?").get(req.params.id);
+  res.json(row2hospital(updated, req));
+});
 
 // POST upload hospital photo (admin only)
 router.post("/:id/photo", requireAdmin, upload.single("photo"), (req, res) => {
@@ -104,16 +117,23 @@ router.post("/:id/photo", requireAdmin, upload.single("photo"), (req, res) => {
   if (!row) return res.status(404).json({ error: "Hospital not found" });
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-  const photoUrl = `/uploads/${req.file.filename}`;
-  db.prepare("UPDATE hospitals SET photo_url=? WHERE id=?").run(photoUrl, req.params.id);
-  res.json({ photoUrl });
+  const relPath = `/uploads/${req.file.filename}`;
+  db.prepare("UPDATE hospitals SET photo_url=? WHERE id=?").run(relPath, req.params.id);
+
+  // Return the full URL so frontend can use it immediately
+  const fullUrl = buildPhotoUrl(req, relPath);
+  res.json({ photoUrl: fullUrl });
 });
 
 // DELETE hospital (admin only)
 router.delete("/:id", requireAdmin, (req, res) => {
-  const doctorCount = db.prepare("SELECT COUNT(*) as c FROM doctors WHERE hospital_id=?").get(req.params.id).c;
+  const doctorCount = db.prepare(
+    "SELECT COUNT(*) as c FROM doctors WHERE hospital_id=?"
+  ).get(req.params.id).c;
   if (doctorCount > 0)
-    return res.status(409).json({ error: "Cannot delete hospital with assigned doctors. Remove doctors first." });
+    return res.status(409).json({
+      error: "Cannot delete hospital with assigned doctors. Remove doctors first.",
+    });
 
   db.prepare("DELETE FROM hospitals WHERE id=?").run(req.params.id);
   res.json({ success: true });
