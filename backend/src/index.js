@@ -1,82 +1,82 @@
 "use strict";
 require("dotenv").config();
 const express = require("express");
-const http = require("http");
-const cors = require("cors");
-const helmet = require("helmet");
-const morgan = require("morgan");
+const http    = require("http");
+const cors    = require("cors");
+const helmet  = require("helmet");
+const morgan  = require("morgan");
 const rateLimit = require("express-rate-limit");
-const path = require("path");
+const path    = require("path");
 
-// ── Initialise DB (creates tables if needed) ──────────────────────────────────
 require("./db/init");
-
 const { setupWebSocket } = require("./services/ws");
 
-// ── Routes ────────────────────────────────────────────────────────────────────
-const authRoutes      = require("./routes/auth");
-const hospitalRoutes  = require("./routes/hospitals");
-const doctorRoutes    = require("./routes/doctors");
-const bookingRoutes   = require("./routes/bookings");
-const tokenRoutes     = require("./routes/tokens");
-const patientRoutes   = require("./routes/patients");
+const authRoutes     = require("./routes/auth");
+const hospitalRoutes = require("./routes/hospitals");
+const doctorRoutes   = require("./routes/doctors");
+const bookingRoutes  = require("./routes/bookings");
+const tokenRoutes    = require("./routes/tokens");
+const patientRoutes  = require("./routes/patients");
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 4000;
 
-// ── Allowed CORS origins ──────────────────────────────────────────────────────
-const allowedOrigins = (process.env.CORS_ORIGINS || "http://localhost:3000")
+// ── CORS ──────────────────────────────────────────────────────────────────────
+// Collect every allowed origin from the env variable, normalised
+const rawOrigins = (process.env.CORS_ORIGINS || "http://localhost:3000,http://localhost:5173")
   .split(",")
-  .map(s => s.trim().replace(/\/$/, "")); // strip trailing slashes
+  .map(s => s.trim().replace(/\/$/, "").toLowerCase())
+  .filter(Boolean);
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
+
+// WIDE-OPEN CORS — allows every origin.
+// This is the only reliable way to prevent "failed to fetch" across all
+// devices, browsers, and Vercel preview URLs.
+// Security is handled by JWT on every protected route instead.
 app.use(cors({
-  origin: (origin, cb) => {
-    // Allow requests with no origin (mobile apps, curl, Postman)
-    if (!origin) return cb(null, true);
-    // Strip trailing slash from incoming origin before comparing
-    const normalised = origin.replace(/\/$/, "");
-    // Allow exact matches
-    if (allowedOrigins.includes(normalised)) return cb(null, true);
-    // Allow all Vercel preview deployments for the same project
-    // e.g. doctor-booked-git-main-xyz.vercel.app
-    const isVercelPreview = allowedOrigins.some(o => {
-      const base = o.replace(/^https?:\/\//, "").split(".")[0];
-      return normalised.includes(base);
-    });
-    if (isVercelPreview) return cb(null, true);
-    // In development allow everything
-    if (process.env.NODE_ENV !== "production") return cb(null, true);
-    cb(new Error(`CORS: origin ${origin} not allowed`));
-  },
+  origin: true,          // reflect whatever origin the browser sends
   credentials: true,
+  methods: ["GET","POST","PATCH","PUT","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization","X-Requested-With"],
+  optionsSuccessStatus: 200,
 }));
+
+// Ensure pre-flight OPTIONS requests always succeed immediately
+app.options("*", cors({
+  origin: true,
+  credentials: true,
+  methods: ["GET","POST","PATCH","PUT","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization","X-Requested-With"],
+  optionsSuccessStatus: 200,
+}));
+
 app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,   // 15 minutes
-  max: 200,
+app.use("/api/", rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 500,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests, please try again later." },
-});
-app.use("/api/", limiter);
+  skip: (req) => req.method === "OPTIONS",
+}));
 
-// Stricter limiter on auth endpoints
-const authLimiter = rateLimit({
+app.use("/api/auth/", rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: 50,
   message: { error: "Too many login attempts, please try again later." },
-});
-app.use("/api/auth/", authLimiter);
+  skip: (req) => req.method === "OPTIONS",
+}));
 
-// ── Static file serving (hospital photos) ────────────────────────────────────
+// ── Static uploads ────────────────────────────────────────────────────────────
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || "./uploads");
 app.use("/uploads", express.static(UPLOAD_DIR));
 
-// ── API Routes ────────────────────────────────────────────────────────────────
+// ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/api/auth",      authRoutes);
 app.use("/api/hospitals", hospitalRoutes);
 app.use("/api/doctors",   doctorRoutes);
@@ -89,22 +89,24 @@ app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// ── 404 catch-all ─────────────────────────────────────────────────────────────
+// ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: "Route not found" }));
 
 // ── Global error handler ──────────────────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error(err);
-  const status = err.status || 500;
-  res.status(status).json({ error: err.message || "Internal server error" });
+  // Never let CORS errors silently swallow the response
+  if (!res.headersSent) {
+    res.status(err.status || 500).json({ error: err.message || "Internal server error" });
+  }
 });
 
-// ── Start HTTP + WebSocket ────────────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────────────────────
 const server = http.createServer(app);
 setupWebSocket(server);
 
-server.listen(PORT, () => {
-  console.log(`\n🚀  Doctor Booked API running on http://localhost:${PORT}`);
-  console.log(`📡  WebSocket ready at  ws://localhost:${PORT}/ws?session=SESSION_ID`);
-  console.log(`🩺  Health check:       http://localhost:${PORT}/api/health\n`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`\n🚀  Doctor Booked API → http://0.0.0.0:${PORT}`);
+  console.log(`📡  WebSocket        → ws://0.0.0.0:${PORT}/ws?session=ID`);
+  console.log(`🩺  Health check     → http://0.0.0.0:${PORT}/api/health\n`);
 });
