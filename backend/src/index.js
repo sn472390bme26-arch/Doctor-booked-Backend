@@ -39,7 +39,7 @@ app.use(cors({
   },
   credentials: true,
 }));
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "20mb" }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────

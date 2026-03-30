@@ -112,33 +112,45 @@ router.patch("/:id", requireDoctorOrAdmin, (req, res) => {
 
   const {
     specialty, hospitalId, isAvailable, bio, sessionTimings,
-    yearsOfExperience, education, languages, tokensPerSession, phone,
+    yearsOfExperience, education, languages, tokensPerSession,
+    phone, contactPhone, photo, name, sessions, price, consultationFee,
   } = req.body;
 
   db.prepare(`
     UPDATE doctors SET
+      name               = COALESCE(?, name),
       specialty          = COALESCE(?, specialty),
       hospital_id        = COALESCE(?, hospital_id),
       is_available       = COALESCE(?, is_available),
       bio                = COALESCE(?, bio),
+      photo              = COALESCE(?, photo),
       session_timings    = COALESCE(?, session_timings),
+      sessions           = COALESCE(?, sessions),
       years_of_experience= COALESCE(?, years_of_experience),
       education          = COALESCE(?, education),
       languages          = COALESCE(?, languages),
       tokens_per_session = COALESCE(?, tokens_per_session),
+      price              = COALESCE(?, price),
+      consultation_fee   = COALESCE(?, consultation_fee),
       phone              = COALESCE(?, phone)
     WHERE id=?
   `).run(
+    name ?? null,
     specialty ?? null,
     hospitalId ?? null,
     isAvailable !== undefined ? (isAvailable ? 1 : 0) : null,
     bio ?? null,
+    photo ?? null,
     sessionTimings ? JSON.stringify(sessionTimings) : null,
+    sessions ? (Array.isArray(sessions) ? sessions.join(",") : sessions) : null,
     yearsOfExperience ?? null,
     education ?? null,
     languages ? JSON.stringify(languages) : null,
     tokensPerSession ?? null,
-    phone ?? null,
+    price ?? null,
+    consultationFee ?? price ?? null,
+    // contactPhone maps to phone column — accept either field name
+    contactPhone ?? phone ?? null,
     req.params.id
   );
 
