@@ -1,15 +1,10 @@
 "use strict";
 const jwt = require("jsonwebtoken");
-
 const SECRET = process.env.JWT_SECRET || "fallback_dev_secret";
 
-/**
- * Attach the decoded JWT payload to req.user.
- * Returns 401 if the token is missing or invalid.
- */
 function requireAuth(req, res, next) {
   const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  const token  = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "No token provided" });
   try {
     req.user = jwt.verify(token, SECRET);
@@ -19,7 +14,6 @@ function requireAuth(req, res, next) {
   }
 }
 
-/** Only allow admin role */
 function requireAdmin(req, res, next) {
   requireAuth(req, res, () => {
     if (req.user.role !== "admin")
@@ -28,7 +22,6 @@ function requireAdmin(req, res, next) {
   });
 }
 
-/** Only allow doctor role */
 function requireDoctor(req, res, next) {
   requireAuth(req, res, () => {
     if (req.user.role !== "doctor")
@@ -37,7 +30,6 @@ function requireDoctor(req, res, next) {
   });
 }
 
-/** Allow doctor OR admin */
 function requireDoctorOrAdmin(req, res, next) {
   requireAuth(req, res, () => {
     if (req.user.role !== "doctor" && req.user.role !== "admin")

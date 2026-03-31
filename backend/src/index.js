@@ -1,23 +1,25 @@
 "use strict";
 require("dotenv").config();
-const express = require("express");
-const http    = require("http");
-const cors    = require("cors");
-const helmet  = require("helmet");
-const morgan  = require("morgan");
+const express   = require("express");
+const http      = require("http");
+const cors      = require("cors");
+const helmet    = require("helmet");
+const morgan    = require("morgan");
 const rateLimit = require("express-rate-limit");
-const path    = require("path");
+const path      = require("path");
+const fs        = require("fs");
 
-require("./db/init");
+// ── DB must init first so pragmas fire before any route uses it ───────────────
+const db = require("./db/init");
 const { setupWebSocket } = require("./services/ws");
 
-// ── Global crash guards — log everything, never die silently ─────────────────
+// ── Global crash guards ───────────────────────────────────────────────────────
 process.on("uncaughtException", (err) => {
-  console.error("[UNCAUGHT EXCEPTION]", err.message);
-  console.error(err.stack);
+  console.error("[CRASH] uncaughtException:", err.message, err.stack);
+  // Don't exit — Railway will restart but we'd lose all WS connections
 });
 process.on("unhandledRejection", (reason) => {
-  console.error("[UNHANDLED REJECTION]", reason);
+  console.error("[CRASH] unhandledRejection:", reason);
 });
 
 const authRoutes     = require("./routes/auth");
@@ -30,62 +32,68 @@ const patientRoutes  = require("./routes/patients");
 const app  = express();
 const PORT = process.env.PORT || 4000;
 
-// ── CORS ──────────────────────────────────────────────────────────────────────
-// Collect every allowed origin from the env variable, normalised
-const rawOrigins = (process.env.CORS_ORIGINS || "http://localhost:3000,http://localhost:5173")
-  .split(",")
-  .map(s => s.trim().replace(/\/$/, "").toLowerCase())
-  .filter(Boolean);
-
-app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
-
-// WIDE-OPEN CORS — allows every origin.
-// This is the only reliable way to prevent "failed to fetch" across all
-// devices, browsers, and Vercel preview URLs.
-// Security is handled by JWT on every protected route instead.
-app.use(cors({
-  origin: true,          // reflect whatever origin the browser sends
-  credentials: true,
-  methods: ["GET","POST","PATCH","PUT","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization","X-Requested-With"],
-  optionsSuccessStatus: 200,
+// ── Security headers ──────────────────────────────────────────────────────────
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  contentSecurityPolicy: false, // API server — no HTML to protect
 }));
 
-// Ensure pre-flight OPTIONS requests always succeed immediately
-app.options("*", cors({
+// ── CORS — wide open, security via JWT ───────────────────────────────────────
+const corsOptions = {
   origin: true,
   credentials: true,
   methods: ["GET","POST","PATCH","PUT","DELETE","OPTIONS"],
   allowedHeaders: ["Content-Type","Authorization","X-Requested-With"],
   optionsSuccessStatus: 200,
-}));
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
+// ── Body parsing ──────────────────────────────────────────────────────────────
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
-app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
+
+// ── Logging (skip health checks to reduce noise) ──────────────────────────────
+app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev", {
+  skip: (req) => req.path === "/api/health",
+}));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
+// Global: 1000 req / 15 min per IP (handles 300 users refreshing every 30s)
 app.use("/api/", rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 500,
+  max: 1000,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: "Too many requests, please try again later." },
+  message: { error: "Too many requests — please slow down." },
+  skip: (req) => req.method === "OPTIONS",
+  keyGenerator: (req) => req.ip || "unknown",
+}));
+
+// Auth endpoints: stricter limit to prevent brute force
+app.use("/api/auth/", rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: { error: "Too many login attempts — try again in 15 minutes." },
   skip: (req) => req.method === "OPTIONS",
 }));
 
-app.use("/api/auth/", rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 50,
-  message: { error: "Too many login attempts, please try again later." },
-  skip: (req) => req.method === "OPTIONS",
-}));
+// ── Response compression hint (Railway handles gzip at edge) ─────────────────
+app.use((_req, res, next) => {
+  res.setHeader("Vary", "Accept-Encoding");
+  next();
+});
 
 // ── Static uploads ────────────────────────────────────────────────────────────
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || "./uploads");
-app.use("/uploads", express.static(UPLOAD_DIR));
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+app.use("/uploads", express.static(UPLOAD_DIR, {
+  maxAge: "7d",        // browsers cache photos for 7 days
+  etag: true,
+  lastModified: true,
+}));
 
-// ── Routes ────────────────────────────────────────────────────────────────────
+// ── API routes ────────────────────────────────────────────────────────────────
 app.use("/api/auth",      authRoutes);
 app.use("/api/hospitals", hospitalRoutes);
 app.use("/api/doctors",   doctorRoutes);
@@ -93,29 +101,46 @@ app.use("/api/bookings",  bookingRoutes);
 app.use("/api/tokens",    tokenRoutes);
 app.use("/api/patients",  patientRoutes);
 
-// ── Health check ──────────────────────────────────────────────────────────────
+// ── Health check — also verifies DB is alive ──────────────────────────────────
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+  try {
+    const counts = {
+      users:     db.prepare("SELECT COUNT(*) as c FROM users").get().c,
+      hospitals: db.prepare("SELECT COUNT(*) as c FROM hospitals").get().c,
+      doctors:   db.prepare("SELECT COUNT(*) as c FROM doctors").get().c,
+      bookings:  db.prepare("SELECT COUNT(*) as c FROM bookings").get().c,
+    };
+    res.json({ status: "ok", timestamp: new Date().toISOString(), counts });
+  } catch (err) {
+    res.status(500).json({ status: "error", error: err.message });
+  }
 });
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: "Route not found" }));
 
 // ── Global error handler ──────────────────────────────────────────────────────
+// eslint-disable-next-line no-unused-vars
 app.use((err, _req, res, _next) => {
-  console.error(err);
-  // Never let CORS errors silently swallow the response
+  console.error("[ERROR]", err.message);
   if (!res.headersSent) {
-    res.status(err.status || 500).json({ error: err.message || "Internal server error" });
+    res.status(err.status || 500).json({
+      error: err.message || "Internal server error",
+    });
   }
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Start HTTP + WebSocket ────────────────────────────────────────────────────
 const server = http.createServer(app);
 setupWebSocket(server);
 
+// Increase max connections and keep-alive for high load
+server.maxConnections = 1000;
+server.keepAliveTimeout = 65000;       // > Railway's 60s LB timeout
+server.headersTimeout   = 66000;
+
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`\n🚀  Doctor Booked API → http://0.0.0.0:${PORT}`);
-  console.log(`📡  WebSocket        → ws://0.0.0.0:${PORT}/ws?session=ID`);
-  console.log(`🩺  Health check     → http://0.0.0.0:${PORT}/api/health\n`);
+  console.log(`\n🚀  Doctor Booked API  →  http://0.0.0.0:${PORT}`);
+  console.log(`📡  WebSocket          →  ws://0.0.0.0:${PORT}/ws?session=ID`);
+  console.log(`🩺  Health             →  http://0.0.0.0:${PORT}/api/health\n`);
 });
