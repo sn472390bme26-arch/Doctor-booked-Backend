@@ -102,10 +102,12 @@ router.post("/:sessionId/regulate", requireDoctorOrAdmin, (req, res) => {
 });
 
 // ── POST complete ─────────────────────────────────────────────────────────────
+// Marks the current token as green (seen by doctor) — NOT eligible for refund
 router.post("/:sessionId/complete", requireDoctorOrAdmin, (req, res) => {
   withTx(req.params.sessionId, res, (state) => {
     const statuses = { ...state.tokenStatuses };
-    if (state.currentToken !== null) statuses[state.currentToken] = "green";
+    const completedToken = state.currentToken;
+    if (completedToken !== null) statuses[completedToken] = "green";
 
     let next = state.nextToken;
     if (next === null) {
@@ -114,14 +116,23 @@ router.post("/:sessionId/complete", requireDoctorOrAdmin, (req, res) => {
       if (reds[0] !== undefined) { statuses[reds[0]] = "yellow"; next = reds[0]; }
     }
     saveState(req.params.sessionId, statuses, state.prioritySlots, null, next, state.isClosed);
+
+    // Mark the booking as 'completed' — no refund applicable
+    if (completedToken !== null) {
+      db.prepare(
+        "UPDATE bookings SET status='completed' WHERE session_id=? AND token_number=? AND status='confirmed'"
+      ).run(req.params.sessionId, completedToken);
+    }
   });
 });
 
 // ── POST skip ─────────────────────────────────────────────────────────────────
+// Patient was not present — marked unvisited (purple). Eligible for refund.
 router.post("/:sessionId/skip", requireDoctorOrAdmin, (req, res) => {
   withTx(req.params.sessionId, res, (state) => {
     const statuses = { ...state.tokenStatuses };
-    if (state.currentToken !== null) statuses[state.currentToken] = "unvisited";
+    const skippedToken = state.currentToken;
+    if (skippedToken !== null) statuses[skippedToken] = "unvisited";
 
     let next = state.nextToken;
     if (next === null) {
@@ -130,16 +141,29 @@ router.post("/:sessionId/skip", requireDoctorOrAdmin, (req, res) => {
       if (reds[0] !== undefined) { statuses[reds[0]] = "yellow"; next = reds[0]; }
     }
     saveState(req.params.sessionId, statuses, state.prioritySlots, null, next, state.isClosed);
+
+    // Mark the skipped patient's booking as 'unvisited' — refund eligible
+    if (skippedToken !== null) {
+      db.prepare(
+        "UPDATE bookings SET status='unvisited' WHERE session_id=? AND token_number=? AND status='confirmed'"
+      ).run(req.params.sessionId, skippedToken);
+    }
   });
 });
 
 // ── POST complete-skipped ─────────────────────────────────────────────────────
+// Previously skipped patient returned and was seen — NOT eligible for refund
 router.post("/:sessionId/complete-skipped", requireDoctorOrAdmin, (req, res) => {
   const tokenNum = Number(req.body.tokenNum);
   withTx(req.params.sessionId, res, (state) => {
     const statuses = { ...state.tokenStatuses };
     if (statuses[tokenNum] === "unvisited") statuses[tokenNum] = "green";
     saveState(req.params.sessionId, statuses, state.prioritySlots, state.currentToken, state.nextToken, state.isClosed);
+
+    // Patient was eventually seen — mark completed, remove from refund eligibility
+    db.prepare(
+      "UPDATE bookings SET status='completed' WHERE session_id=? AND token_number=? AND status='unvisited'"
+    ).run(req.params.sessionId, tokenNum);
   });
 });
 
