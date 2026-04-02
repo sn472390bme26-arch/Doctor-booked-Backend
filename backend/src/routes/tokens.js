@@ -128,19 +128,36 @@ router.post("/:sessionId/complete", requireDoctorOrAdmin, (req, res) => {
 
 // ── POST skip ─────────────────────────────────────────────────────────────────
 // Patient was not present — marked unvisited (purple). Eligible for refund.
+// Accepts optional tokenNum in body — used when skipping directly from a red
+// token without calling regulate first (currentToken would be null otherwise).
 router.post("/:sessionId/skip", requireDoctorOrAdmin, (req, res) => {
   withTx(req.params.sessionId, res, (state) => {
     const statuses = { ...state.tokenStatuses };
-    const skippedToken = state.currentToken;
-    if (skippedToken !== null) statuses[skippedToken] = "unvisited";
 
-    let next = state.nextToken;
+    // Use explicit tokenNum if provided (direct skip from red/yellow),
+    // otherwise fall back to currentToken (skip after marking ongoing)
+    const skippedToken = (req.body.tokenNum != null)
+      ? Number(req.body.tokenNum)
+      : state.currentToken;
+
+    if (skippedToken !== null) {
+      statuses[skippedToken] = "unvisited"; // purple
+    }
+
+    // If this token was the current active one, clear it
+    const newCurrent = state.currentToken === skippedToken ? null : state.currentToken;
+
+    // Find next red token to become yellow (next up)
+    let next = (state.nextToken !== skippedToken) ? state.nextToken : null;
     if (next === null) {
       const reds = Object.entries(statuses)
-        .filter(([, s]) => s === "red").map(([n]) => Number(n)).sort((a, b) => a - b);
+        .filter(([n, s]) => s === "red" && Number(n) !== skippedToken)
+        .map(([n]) => Number(n))
+        .sort((a, b) => a - b);
       if (reds[0] !== undefined) { statuses[reds[0]] = "yellow"; next = reds[0]; }
     }
-    saveState(req.params.sessionId, statuses, state.prioritySlots, null, next, state.isClosed);
+
+    saveState(req.params.sessionId, statuses, state.prioritySlots, newCurrent, next, state.isClosed);
 
     // Mark the skipped patient's booking as 'unvisited' — refund eligible
     if (skippedToken !== null) {
