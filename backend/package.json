@@ -1,7 +1,7 @@
 {
   "name": "doctor-booked-backend",
   "version": "1.0.0",
-  "description": "Doctor Booked — production backend API",
+  "description": "Doctor Booked \u2014 production backend API",
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
@@ -22,7 +22,8 @@
     "better-sqlite3": "^11.1.2",
     "ws": "^8.18.0",
     "helmet": "^7.1.0",
-    "morgan": "^1.10.0"
+    "morgan": "^1.10.0",
+    "google-auth-library": "^9.14.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.4"
