@@ -127,6 +127,27 @@ db.stmts = {
   ),
 };
 
+// ── Safe migrations — add new columns without breaking existing data ──────────
+const safeAlter = (sql) => { try { db.prepare(sql).run(); } catch (_) {} };
+safeAlter("ALTER TABLE users ADD COLUMN phone TEXT");
+safeAlter("ALTER TABLE users ADD COLUMN phone_verified INTEGER NOT NULL DEFAULT 0");
+
+// OTP store table — holds pending phone verifications (expires in 10 min)
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS otp_pending (
+    id          TEXT PRIMARY KEY,
+    phone       TEXT NOT NULL,
+    otp         TEXT NOT NULL,
+    context     TEXT NOT NULL,   -- 'signup' | 'google' | 'login'
+    data        TEXT,            -- JSON: email, name, password_hash, etc
+    expires_at  INTEGER NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  )
+`).run();
+
+db.prepare(`CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_pending(phone)`).run();
+
 console.log("✅  Database ready:", path.resolve(DB_PATH));
 console.log("   WAL mode     :", db.pragma("journal_mode", { simple: true }));
 console.log("   Busy timeout :", db.pragma("busy_timeout",  { simple: true }), "ms");
