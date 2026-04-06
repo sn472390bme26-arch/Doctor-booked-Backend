@@ -1,11 +1,11 @@
 "use strict";
-const express  = require("express");
-const bcrypt   = require("bcryptjs");
-const jwt      = require("jsonwebtoken");
+const express = require("express");
+const bcrypt  = require("bcryptjs");
+const jwt     = require("jsonwebtoken");
 const { body, validationResult } = require("express-validator");
 const { OAuth2Client } = require("google-auth-library");
-const db       = require("../db/init");
-const { verifyFirebaseToken } = require("../services/firebase-admin");
+const db      = require("../db/init");
+const { sendOTP, generateOTP, normalisePhone, IS_DEV } = require("../services/sms");
 
 const router     = express.Router();
 const SECRET     = process.env.JWT_SECRET     || "fallback_dev_secret";
@@ -15,64 +15,52 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 
 const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 
-function sign(payload) {
-  return jwt.sign(payload, SECRET, { expiresIn: EXPIRES });
-}
+function sign(payload) { return jwt.sign(payload, SECRET, { expiresIn: EXPIRES }); }
 function validate(req, res) {
   const e = validationResult(req);
   if (!e.isEmpty()) { res.status(400).json({ error: e.array()[0].msg }); return false; }
   return true;
 }
-// Normalise phone to digits only (strip +)
-function normalisePhone(phone) {
-  return phone.replace(/\D/g, "");
+function cleanOTPs() {
+  db.prepare("DELETE FROM otp_pending WHERE expires_at < ?").run(Date.now());
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/auth/patient/signup
-// Called AFTER Firebase phone verification.
-// Frontend sends: name, email, password, firebaseIdToken (from phone auth)
-// Backend verifies token, extracts phone, creates account.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Patient Signup — Step 1: send OTP ────────────────────────────────────────
 router.post("/patient/signup",
   [
     body("email").isEmail().normalizeEmail(),
     body("name").trim().notEmpty().withMessage("Name is required"),
-    body("password").isLength({ min: 6 }).withMessage("Password must be at least 6 characters"),
-    body("firebaseIdToken").notEmpty().withMessage("Phone verification token is required"),
+    body("password").isLength({ min: 6 }).withMessage("Password must be at least 6 chars"),
+    body("phone").trim().notEmpty().withMessage("Phone number is required"),
   ],
   async (req, res) => {
     if (!validate(req, res)) return;
     try {
-      const { email, name, password, firebaseIdToken } = req.body;
+      const { email, name, password, phone } = req.body;
+      const normPhone = normalisePhone(phone);
 
-      // 1. Verify Firebase token → extract phone number
-      let phoneNumber;
-      try {
-        const decoded = await verifyFirebaseToken(firebaseIdToken);
-        phoneNumber = normalisePhone(decoded.phoneNumber); // strip + → 919876543210
-      } catch (err) {
-        return res.status(401).json({ error: `Phone verification failed: ${err.message}` });
-      }
-
-      // 2. Check duplicates
       if (db.prepare("SELECT id FROM users WHERE email=?").get(email))
-        return res.status(409).json({ error: "An account with this email already exists. Please log in." });
-      if (db.prepare("SELECT id FROM users WHERE phone=? AND role='patient'").get(phoneNumber))
-        return res.status(409).json({ error: "This phone number is already registered. Please log in." });
+        return res.status(409).json({ error: "Email already registered. Please log in." });
+      if (db.prepare("SELECT id FROM users WHERE phone=? AND role='patient'").get(normPhone))
+        return res.status(409).json({ error: "Phone number already registered. Please log in." });
 
-      // 3. Create account with verified phone
-      const id   = `p_${email}`;
-      const hash = bcrypt.hashSync(password, 12);
-      db.prepare(
-        "INSERT INTO users (id, email, name, password, role, phone, phone_verified) VALUES (?,?,?,?,'patient',?,1)"
-      ).run(id, email, name, hash, phoneNumber);
+      const otp       = generateOTP();
+      const otpId     = `otp_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+      const expiresAt = Date.now() + 10 * 60 * 1000;
+      const hash      = bcrypt.hashSync(password, 12);
 
-      console.log(`[auth signup] created: ${email} phone: ${phoneNumber}`);
-      res.json({
-        token: sign({ id, email, name, role: "patient" }),
-        user:  { id, email, name, role: "patient" },
-      });
+      db.prepare("DELETE FROM otp_pending WHERE phone=? AND context='signup'").run(normPhone);
+      db.prepare(`
+        INSERT INTO otp_pending (id, phone, otp, context, data, expires_at)
+        VALUES (?,?,?,'signup',?,?)
+      `).run(otpId, normPhone, otp, JSON.stringify({ email, name, hash }), expiresAt);
+
+      await sendOTP(normPhone, otp);
+
+      const resp = { success: true, otpId, maskedPhone: `+${normPhone.slice(0,2)}XXXXX${normPhone.slice(-4)}`,
+                     message: `OTP sent to your phone. Enter it to complete registration.` };
+      if (IS_DEV) resp.devOtp = otp;
+      res.json(resp);
     } catch (err) {
       console.error("[auth signup]", err.message);
       res.status(500).json({ error: err.message });
@@ -80,23 +68,19 @@ router.post("/patient/signup",
   }
 );
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/auth/patient/login
-// Step 1: verify email+password → return which phone to send OTP to
-// The frontend then triggers Firebase OTP to that phone
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Patient Login — Step 1: verify credentials, send OTP ─────────────────────
 router.post("/patient/login",
   [body("email").isEmail().normalizeEmail(), body("password").notEmpty()],
-  (req, res) => {
+  async (req, res) => {
     if (!validate(req, res)) return;
     try {
       const { email, password } = req.body;
       const user = db.prepare("SELECT * FROM users WHERE email=? AND role='patient'").get(email);
-      if (!user) return res.status(401).json({ error: "No account found with this email. Please sign up first." });
+      if (!user) return res.status(401).json({ error: "No account found with this email." });
       if (!bcrypt.compareSync(password, user.password)) return res.status(401).json({ error: "Incorrect password." });
 
+      // Old account without phone — log in directly
       if (!user.phone || !user.phone_verified) {
-        // Old account without phone — log in directly, prompt to add phone
         return res.json({
           token: sign({ id: user.id, email: user.email, name: user.name, role: "patient" }),
           user:  { id: user.id, email: user.email, name: user.name, role: "patient" },
@@ -104,69 +88,125 @@ router.post("/patient/login",
         });
       }
 
-      // Credentials correct + phone exists → tell frontend which phone to OTP
-      // Frontend will call Firebase sendOTP, then call /patient/login-verify
-      res.json({
-        success: true,
-        userId:  user.id,
-        phone:   user.phone, // frontend uses this to call Firebase OTP
-        maskedPhone: `+${user.phone.slice(0,2)}XXXXX${user.phone.slice(-4)}`,
-      });
+      const otp       = generateOTP();
+      const otpId     = `otp_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+      const expiresAt = Date.now() + 10 * 60 * 1000;
+
+      db.prepare("DELETE FROM otp_pending WHERE phone=? AND context='login'").run(user.phone);
+      db.prepare(`
+        INSERT INTO otp_pending (id, phone, otp, context, data, expires_at)
+        VALUES (?,?,?,'login',?,?)
+      `).run(otpId, user.phone, otp, JSON.stringify({ userId: user.id }), expiresAt);
+
+      await sendOTP(user.phone, otp);
+
+      const resp = { success: true, otpId,
+                     maskedPhone: `+${user.phone.slice(0,2)}XXXXX${user.phone.slice(-4)}`,
+                     message: `OTP sent to your registered phone.` };
+      if (IS_DEV) resp.devOtp = otp;
+      res.json(resp);
     } catch (err) {
-      console.error("[auth patient/login]", err.message);
+      console.error("[auth login]", err.message);
       res.status(500).json({ error: err.message });
     }
   }
 );
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/auth/patient/login-verify
-// Step 2: frontend verified OTP with Firebase → sends firebaseIdToken here
-// Backend verifies token, confirms phone matches account, returns JWT
-// ─────────────────────────────────────────────────────────────────────────────
-router.post("/patient/login-verify",
-  [
-    body("userId").notEmpty(),
-    body("firebaseIdToken").notEmpty(),
-  ],
-  async (req, res) => {
-    if (!validate(req, res)) return;
-    try {
-      const { userId, firebaseIdToken } = req.body;
+// ── Verify OTP — works for signup, login, google ──────────────────────────────
+router.post("/patient/verify-otp", async (req, res) => {
+  try {
+    cleanOTPs();
+    const { otpId, otp } = req.body;
+    if (!otpId || !otp) return res.status(400).json({ error: "otpId and otp are required." });
 
-      // Verify Firebase token
-      let decoded;
-      try {
-        decoded = await verifyFirebaseToken(firebaseIdToken);
-      } catch (err) {
-        return res.status(401).json({ error: `Phone verification failed: ${err.message}` });
-      }
+    const pending = db.prepare("SELECT * FROM otp_pending WHERE id=?").get(otpId);
+    if (!pending) return res.status(400).json({ error: "OTP session not found or expired. Please request a new OTP." });
+    if (Date.now() > pending.expires_at) {
+      db.prepare("DELETE FROM otp_pending WHERE id=?").run(otpId);
+      return res.status(400).json({ error: "OTP has expired. Please request a new one." });
+    }
+    if (pending.attempts >= 5) {
+      db.prepare("DELETE FROM otp_pending WHERE id=?").run(otpId);
+      return res.status(429).json({ error: "Too many wrong attempts. Please request a new OTP." });
+    }
+    if (pending.otp !== otp.trim()) {
+      db.prepare("UPDATE otp_pending SET attempts=attempts+1 WHERE id=?").run(otpId);
+      const left = 5 - (pending.attempts + 1);
+      return res.status(400).json({ error: `Incorrect OTP. ${left} attempt${left !== 1 ? "s" : ""} remaining.` });
+    }
 
-      const user = db.prepare("SELECT * FROM users WHERE id=?").get(userId);
-      if (!user) return res.status(404).json({ error: "Account not found." });
+    const data = JSON.parse(pending.data || "{}");
+    db.prepare("DELETE FROM otp_pending WHERE id=?").run(otpId);
 
-      // Confirm the verified phone matches the account's phone
-      const verifiedPhone = normalisePhone(decoded.phoneNumber);
-      if (verifiedPhone !== user.phone) {
-        return res.status(401).json({ error: "Verified phone does not match account. Please contact support." });
-      }
-
-      console.log(`[auth login] verified: ${user.email}`);
-      res.json({
+    // ── Signup: create account ────────────────────────────────────────────────
+    if (pending.context === "signup") {
+      const { email, name, hash } = data;
+      const id = `p_${email}`;
+      db.prepare(`
+        INSERT INTO users (id, email, name, password, role, phone, phone_verified)
+        VALUES (?,?,?,?,'patient',?,1)
+      `).run(id, email, name, hash, pending.phone);
+      const user = db.prepare("SELECT * FROM users WHERE id=?").get(id);
+      console.log(`[auth] signup verified: ${email} phone: ${pending.phone}`);
+      return res.json({
         token: sign({ id: user.id, email: user.email, name: user.name, role: "patient" }),
         user:  { id: user.id, email: user.email, name: user.name, role: "patient" },
       });
-    } catch (err) {
-      console.error("[auth login-verify]", err.message);
-      res.status(500).json({ error: err.message });
     }
-  }
-);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/auth/patient/google
-// Google One Tap → verify Google token → if phone not verified, return needsPhone
-// ─────────────────────────────────────────────────────────────────────────────
+    // ── Login: return JWT ─────────────────────────────────────────────────────
+    if (pending.context === "login") {
+      const user = db.prepare("SELECT * FROM users WHERE id=?").get(data.userId);
+      if (!user) return res.status(404).json({ error: "Account not found." });
+      console.log(`[auth] login verified: ${user.email}`);
+      return res.json({
+        token: sign({ id: user.id, email: user.email, name: user.name, role: "patient" }),
+        user:  { id: user.id, email: user.email, name: user.name, role: "patient" },
+      });
+    }
+
+    // ── Google: save phone to account ─────────────────────────────────────────
+    if (pending.context === "google") {
+      const user = db.prepare("SELECT * FROM users WHERE id=?").get(data.userId);
+      if (!user) return res.status(404).json({ error: "Account not found." });
+      db.prepare("UPDATE users SET phone=?, phone_verified=1 WHERE id=?").run(pending.phone, user.id);
+      console.log(`[auth] google phone verified: ${user.email} → ${pending.phone}`);
+      return res.json({
+        token: sign({ id: user.id, email: user.email, name: user.name, role: "patient" }),
+        user:  { id: user.id, email: user.email, name: user.name, role: "patient" },
+      });
+    }
+
+    res.status(400).json({ error: "Unknown OTP context." });
+  } catch (err) {
+    console.error("[auth verify-otp]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Resend OTP ────────────────────────────────────────────────────────────────
+router.post("/patient/resend-otp", async (req, res) => {
+  try {
+    const { otpId } = req.body;
+    const pending = db.prepare("SELECT * FROM otp_pending WHERE id=?").get(otpId);
+    if (!pending) return res.status(400).json({ error: "OTP session not found. Please start over." });
+
+    const otp       = generateOTP();
+    const expiresAt = Date.now() + 10 * 60 * 1000;
+    db.prepare("UPDATE otp_pending SET otp=?, expires_at=?, attempts=0 WHERE id=?").run(otp, expiresAt, otpId);
+
+    await sendOTP(pending.phone, otp);
+
+    const resp = { success: true, message: `New OTP sent.` };
+    if (IS_DEV) resp.devOtp = otp;
+    res.json(resp);
+  } catch (err) {
+    console.error("[auth resend-otp]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Google One Tap login ──────────────────────────────────────────────────────
 router.post("/patient/google", async (req, res) => {
   try {
     if (!googleClient || !GOOGLE_CLIENT_ID)
@@ -191,7 +231,6 @@ router.post("/patient/google", async (req, res) => {
       console.log(`[auth google] created: ${email}`);
     }
 
-    // If phone already verified → straight in
     if (user.phone && user.phone_verified) {
       return res.json({
         token: sign({ id: user.id, email: user.email, name: user.name, role: "patient" }),
@@ -199,9 +238,7 @@ router.post("/patient/google", async (req, res) => {
       });
     }
 
-    // Needs phone verification
     return res.json({ needsPhone: true, userId: user.id, name: user.name, email: user.email });
-
   } catch (err) {
     console.error("[auth google]", err.message);
     if (err.message?.includes("Token used too late") || err.message?.includes("Invalid token"))
@@ -210,46 +247,38 @@ router.post("/patient/google", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/auth/patient/google-verify-phone
-// After Google login, user verified phone via Firebase → save phone to account
-// ─────────────────────────────────────────────────────────────────────────────
-router.post("/patient/google-verify-phone",
-  [body("userId").notEmpty(), body("firebaseIdToken").notEmpty()],
-  async (req, res) => {
-    if (!validate(req, res)) return;
-    try {
-      const { userId, firebaseIdToken } = req.body;
+// ── Google: send OTP to collected phone ──────────────────────────────────────
+router.post("/patient/google-phone-otp", async (req, res) => {
+  try {
+    const { userId, phone } = req.body;
+    if (!userId || !phone) return res.status(400).json({ error: "userId and phone are required." });
+    const normPhone = normalisePhone(phone);
 
-      let decoded;
-      try {
-        decoded = await verifyFirebaseToken(firebaseIdToken);
-      } catch (err) {
-        return res.status(401).json({ error: `Phone verification failed: ${err.message}` });
-      }
+    const taken = db.prepare("SELECT id FROM users WHERE phone=? AND id!=?").get(normPhone, userId);
+    if (taken) return res.status(409).json({ error: "This phone is already registered to another account." });
 
-      const user = db.prepare("SELECT * FROM users WHERE id=?").get(userId);
-      if (!user) return res.status(404).json({ error: "Account not found." });
+    const otp       = generateOTP();
+    const otpId     = `otp_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+    const expiresAt = Date.now() + 10 * 60 * 1000;
 
-      const phoneNumber = normalisePhone(decoded.phoneNumber);
+    db.prepare("DELETE FROM otp_pending WHERE phone=? AND context='google'").run(normPhone);
+    db.prepare(`
+      INSERT INTO otp_pending (id, phone, otp, context, data, expires_at)
+      VALUES (?,?,?,'google',?,?)
+    `).run(otpId, normPhone, otp, JSON.stringify({ userId }), expiresAt);
 
-      // Check phone not already used by another account
-      const taken = db.prepare("SELECT id FROM users WHERE phone=? AND id!=?").get(phoneNumber, userId);
-      if (taken) return res.status(409).json({ error: "This phone is already registered to another account." });
+    await sendOTP(normPhone, otp);
 
-      db.prepare("UPDATE users SET phone=?, phone_verified=1 WHERE id=?").run(phoneNumber, userId);
-      console.log(`[auth google] phone saved: ${user.email} → ${phoneNumber}`);
-
-      res.json({
-        token: sign({ id: user.id, email: user.email, name: user.name, role: "patient" }),
-        user:  { id: user.id, email: user.email, name: user.name, role: "patient" },
-      });
-    } catch (err) {
-      console.error("[auth google-verify-phone]", err.message);
-      res.status(500).json({ error: err.message });
-    }
+    const resp = { success: true, otpId,
+                   maskedPhone: `+${normPhone.slice(0,2)}XXXXX${normPhone.slice(-4)}`,
+                   message: `OTP sent to your phone.` };
+    if (IS_DEV) resp.devOtp = otp;
+    res.json(resp);
+  } catch (err) {
+    console.error("[auth google-phone-otp]", err.message);
+    res.status(500).json({ error: err.message });
   }
-);
+});
 
 // ── Doctor login ──────────────────────────────────────────────────────────────
 router.post("/doctor/login",
@@ -259,8 +288,8 @@ router.post("/doctor/login",
     try {
       const { code, phone } = req.body;
       const doctor = db.prepare("SELECT * FROM doctors WHERE UPPER(code)=UPPER(?)").get(code.trim());
-      if (!doctor)                       return res.status(401).json({ error: "Invalid access code. Please check with your admin." });
-      if (!(doctor.phone || "").trim())  return res.status(401).json({ error: "No phone number set for this doctor. Contact admin." });
+      if (!doctor) return res.status(401).json({ error: "Invalid access code. Please check with your admin." });
+      if (!(doctor.phone || "").trim()) return res.status(401).json({ error: "No phone number set for this doctor. Contact admin." });
       if (phone.trim() !== (doctor.phone || "").trim())
         return res.status(401).json({ error: "Incorrect password. Use your registered phone number." });
       const payload = { id: `doc_${doctor.code}`, code: doctor.code, doctorId: doctor.id, role: "doctor" };
