@@ -131,6 +131,8 @@ db.stmts = {
 const safeAlter = (sql) => { try { db.prepare(sql).run(); } catch (_) {} };
 safeAlter("ALTER TABLE users ADD COLUMN phone TEXT");
 safeAlter("ALTER TABLE users ADD COLUMN phone_verified INTEGER NOT NULL DEFAULT 0");
+safeAlter("ALTER TABLE bookings ADD COLUMN razorpay_order_id TEXT");
+safeAlter("ALTER TABLE bookings ADD COLUMN razorpay_payment_id TEXT");
 
 // OTP store table — holds pending phone verifications (expires in 10 min)
 db.prepare(`

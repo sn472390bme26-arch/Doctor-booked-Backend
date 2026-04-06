@@ -28,6 +28,7 @@ const doctorRoutes   = require("./routes/doctors");
 const bookingRoutes  = require("./routes/bookings");
 const tokenRoutes    = require("./routes/tokens");
 const patientRoutes  = require("./routes/patients");
+const paymentRoutes  = require("./routes/payments");
 
 const app  = express();
 const PORT = process.env.PORT || 4000;
@@ -100,6 +101,7 @@ app.use("/api/doctors",   doctorRoutes);
 app.use("/api/bookings",  bookingRoutes);
 app.use("/api/tokens",    tokenRoutes);
 app.use("/api/patients",  patientRoutes);
+app.use("/api/payments",  paymentRoutes);
 
 // ── Health check — also verifies DB is alive ──────────────────────────────────
 app.get("/api/health", (_req, res) => {
